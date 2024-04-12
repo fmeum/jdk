@@ -133,6 +133,22 @@ public class JLinkNegativeTest {
         }
     }
 
+    public void testOutputIsNonEmptyDirectory() throws IOException {
+        // output == file
+        Path image = helper.createNewImageDir("failure5");
+        Files.createDirectory(image);
+        Path file = image.resolve("some_file");
+        Files.createFile(file);
+        JImageGenerator.getJLinkTask()
+                .modulePath(helper.defaultModulePath())
+                .output(image)
+                .addMods("leaf1")
+                .call().assertFailure("Error: directory already exists: .*failure5.image(\n|\r|.)*");
+        if (Files.notExists(image) || Files.notExists(file)) {
+            throw new RuntimeException("output directory and file should not have been deleted");
+        }
+    }
+
     public void testModuleNotFound() {
         // limit module is not found
         Path imageFile = helper.createNewImageDir("test");

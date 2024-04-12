@@ -27,6 +27,7 @@ package jdk.tools.jlink.internal;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.nio.file.Files;
+import java.nio.file.NotDirectoryException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.text.MessageFormat;
@@ -413,9 +414,16 @@ public final class TaskHelper {
                                                       Platform targetPlatform)
                 throws IOException, BadArgs {
             if (output != null) {
-                if (Files.exists(output)) {
-                    throw new IllegalArgumentException(PluginsResourceBundle.
+                if (!Files.notExists(output)) {
+                    try (Stream<Path> stream = Files.list(output)) {
+                        if (stream.findAny().isPresent()) {
+                            throw new IllegalArgumentException(PluginsResourceBundle.
+                                getMessage("err.dir.already.exits", output));
+                        }
+                    } catch (NotDirectoryException e) {
+                        throw new IllegalArgumentException(PluginsResourceBundle.
                             getMessage("err.dir.already.exits", output));
+                    }
                 }
             }
 

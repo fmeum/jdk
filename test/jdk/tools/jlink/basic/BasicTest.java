@@ -114,6 +114,15 @@ public class BasicTest {
         // specify main class in --launcher command line
         runJlink(image, TEST_MODULE, "--launcher", "adder=" + TEST_MODULE + "/jdk.test.Adder");
         addAndCheck(image, "adder");
+        Files.delete(jmods.resolve(TEST_MODULE + ".jmod"));
+
+        image = Paths.get("already_exists");
+        Files.createDirectory(image);
+        // the output directory already exists, but is empty
+        runJmod(classes.toString(), TEST_MODULE, false /* no ModuleMainClass! */);
+        runJlink(image, TEST_MODULE, "--launcher", "adder=" + TEST_MODULE + "/jdk.test.Adder");
+        addAndCheck(image, "adder");
+        Files.delete(jmods.resolve(TEST_MODULE + ".jmod"));
     }
 
     private void addAndCheck(Path image, String scriptName) throws Throwable {
