@@ -1250,19 +1250,31 @@ static inline int port__poll(port_state_t* port_state,
 
   LeaveCriticalSection(&port_state->lock);
 
+  /* Use an alertable wait (TRUE) to allow APCs to be delivered. This is
+   * necessary because NtCancelIoFileEx, used to cancel pending AFD poll
+   * operations, delivers a kernel APC to the thread that initiated the I/O.
+   * If this thread is in a non-alertable wait, the APC cannot be delivered
+   * and the cancellation will hang indefinitely. See:
+   * https://www.ntkernel.com/a-rare-cancelioex-hang-in-go-on-windows/ */
   BOOL r = GetQueuedCompletionStatusEx(port_state->iocp_handle,
                                        iocp_events,
                                        maxevents,
                                        &completion_count,
                                        timeout,
-                                       FALSE);
+                                       TRUE);
 
   EnterCriticalSection(&port_state->lock);
 
   port_state->active_poll_count--;
 
-  if (!r)
-    return_map_error(-1);
+  if (!r) {
+    DWORD error = GetLastError();
+    /* If the wait was interrupted by an APC (e.g., from NtCancelIoFileEx),
+     * return 0 to indicate no events. The caller will retry the wait. */
+    if (error == WAIT_IO_COMPLETION)
+      return 0;
+    return_set_error(-1, error);
+  }
 
   return port__feed_events(
       port_state, epoll_events, iocp_events, completion_count);
