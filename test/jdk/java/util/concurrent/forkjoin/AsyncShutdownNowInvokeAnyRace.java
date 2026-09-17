@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -78,10 +78,18 @@ public class AsyncShutdownNowInvokeAnyRace {
      */
     @Test
     public void testInvokeAny() throws Exception {
+        // Every rep creates a pool and a worker thread and tears them
+        // down again, which is slow on some platforms (e.g. Windows),
+        // so besides the rep count also bound the total running time
+        // to stay well within the jtreg timeout.
         final int reps = 30_000;
+        final long quittingTimeNanos = System.nanoTime() + SECONDS.toNanos(60);
         ThreadLocalRandom rnd = ThreadLocalRandom.current();
         int falseAlarms = 0;
-        for (int rep = 1; rep < reps; rep++) {
+        int rep;
+        for (rep = 1; rep < reps; rep++) {
+            if (System.nanoTime() - quittingTimeNanos > 0)
+                break;
             ForkJoinPool pool = new ForkJoinPool(1);
             CountDownLatch pleaseShutdownNow = new CountDownLatch(1);
             int nTasks = rnd.nextInt(2, 5);
@@ -140,10 +148,11 @@ public class AsyncShutdownNowInvokeAnyRace {
             } finally {
                 pool.shutdown();
             }
-            if (falseAlarms != 0)
-                System.out.println("Premature shutdowns = " + falseAlarms);
             shutdownResult.get();
         }
+        System.out.println("Completed reps = " + (rep - 1));
+        if (falseAlarms != 0)
+            System.out.println("Premature shutdowns = " + falseAlarms);
     }
 
     //--- thread stack dumping (from JSR166TestCase.java) ---
