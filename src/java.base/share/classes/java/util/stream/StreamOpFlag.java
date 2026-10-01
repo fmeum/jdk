@@ -202,6 +202,7 @@ import java.util.Spliterator;
  *
  * @since 1.8
  */
+@jdk.internal.vm.annotation.TrustFinalFields
 enum StreamOpFlag {
 
     /*

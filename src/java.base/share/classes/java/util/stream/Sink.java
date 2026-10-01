@@ -29,6 +29,7 @@ import java.util.function.Consumer;
 import java.util.function.DoubleConsumer;
 import java.util.function.IntConsumer;
 import java.util.function.LongConsumer;
+import jdk.internal.vm.annotation.TrustFinalFields;
 
 /**
  * An extension of {@link Consumer} used to conduct values through the stages of
@@ -244,6 +245,7 @@ interface Sink<T> extends Consumer<T> {
      * implementation of the {@code accept()} method must call the correct
      * {@code accept()} method on the downstream {@code Sink}.
      */
+    @TrustFinalFields
     abstract static class ChainedReference<T, E_OUT> implements Sink<T> {
         protected final Sink<? super E_OUT> downstream;
 

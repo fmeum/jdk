@@ -573,6 +573,17 @@
   product(bool, ReduceAllocationMerges, true, DIAGNOSTIC,                   \
           "Try to simplify allocation merges before Scalar Replacement")    \
                                                                             \
+  product(bool, FoldLoadsThroughCtorBarriers, false, DIAGNOSTIC,            \
+          "Let field loads walk past release-type memory barriers (as "     \
+          "emitted at the end of constructors that write final fields) "    \
+          "when searching for a previous store to fold against")            \
+                                                                            \
+  product(bool, FoldLocalFinalFieldLoads, false, DIAGNOSTIC,                \
+          "Fold loads of trusted final instance fields of objects "         \
+          "allocated in the current compilation unit to the value "         \
+          "stored by the constructor, looking through calls, memory "       \
+          "barriers and memory Phis, before Escape Analysis")               \
+                                                                            \
   develop(bool, TraceReduceAllocationMerges, false,                         \
              "Trace decision for simplifying allocation merges.")           \
                                                                             \

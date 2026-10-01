@@ -824,6 +824,108 @@ ArrayCopyNode* MemNode::find_array_copy_clone(Node* ld_alloc, Node* mem) const {
   return nullptr;
 }
 
+// If 'n' is a regular (not mismatched or unsafe) load from a non-volatile, non-flat instance
+// field, return that field.
+static ciField* loaded_instance_field(PhaseValues* phase, const MemNode* n) {
+  if (!n->is_Load() || n->is_mismatched_access() || n->is_unsafe_access()) {
+    return nullptr;
+  }
+  const TypeInstPtr* tp = phase->type(n->in(MemNode::Address))->isa_instptr();
+  if (tp == nullptr || tp->offset() == Type::OffsetBot || tp->offset() == Type::OffsetTop) {
+    return nullptr;
+  }
+  Compile::AliasType* atp = phase->C->alias_type(tp);
+  if (atp == nullptr || atp->index() < Compile::AliasIdxRaw) {
+    return nullptr;
+  }
+  ciField* field = atp->field();
+  if (field == nullptr || field->is_static() || field->is_volatile() || field->is_flat()) {
+    return nullptr;
+  }
+  return field;
+}
+
+// Is 'n' a load of a trusted final instance field from an object that is allocated in the current
+// compilation unit? Such a field is written exactly once, by a constructor that receives the
+// object as an argument, and can't be changed afterwards. As long as we do not walk past a call
+// that may be that constructor, the only store the load can observe is the one in the (inlined)
+// constructor, no matter which calls, memory barriers or control flow merges lie in between.
+static bool is_local_trusted_final_field_load(PhaseValues* phase, const MemNode* n) {
+  if (!FoldLocalFinalFieldLoads) {
+    return false;
+  }
+  ciField* field = loaded_instance_field(phase, n);
+  if (field == nullptr || !field->is_final() || field->is_stable() || !field->is_constant()) {
+    return false;
+  }
+  intptr_t offset = 0;
+  Node* base = AddPNode::Ideal_base_and_offset(n->in(MemNode::Address), phase, offset);
+  if (base == nullptr) {
+    return false;
+  }
+  // Only consider objects created by a 'new' bytecode: the verifier guarantees that the
+  // constructor of such an object is invoked directly by the method containing the bytecode, so
+  // that the constructor is either inlined or a direct call that receives the object. Objects
+  // allocated by other means (e.g. Unsafe.allocateInstance or clone) are initialized differently.
+  AllocateNode* alloc = AllocateNode::Ideal_allocation(base);
+  if (alloc == nullptr || alloc->jvms() == nullptr || !alloc->jvms()->has_method()) {
+    return false;
+  }
+  JVMState* jvms = alloc->jvms();
+  int bci = jvms->bci();
+  return bci >= 0 && bci < jvms->method()->code_size() &&
+         jvms->method()->java_code_at_bci(bci) == Bytecodes::_new;
+}
+
+// Walk the memory graph upwards from 'mem', looking through Phis, to find the unique memory state
+// in which the load analyzed by 'analyzer' can see its stored value. Returns nullptr if there is no
+// such unique state and NodeSentinel if all paths lead back into a cycle.
+static Node* find_previous_store_through_phis(PhaseGVN* phase, const AccessAnalyzer& analyzer,
+                                                 Node* mem, VectorSet& visited, int& budget) {
+  for (;;) {
+    if (--budget <= 0 || mem == nullptr || phase->type(mem) == Type::TOP) {
+      return nullptr;
+    }
+    if (mem->is_Phi()) {
+      if (visited.test_set(mem->_idx)) {
+        // Either a cycle or a second path to a Phi whose inputs are already being checked.
+        return NodeSentinel;
+      }
+      Node* region = mem->in(0);
+      if (region == nullptr || !region->is_Region()) {
+        return nullptr;
+      }
+      Node* result = NodeSentinel;
+      for (uint i = 1; i < mem->req(); i++) {
+        Node* ctl = region->in(i);
+        Node* in = mem->in(i);
+        if (ctl == nullptr || in == nullptr) {
+          return nullptr; // still under construction
+        }
+        if (phase->type(ctl) == Type::TOP || phase->type(in) == Type::TOP) {
+          continue; // dead path
+        }
+        Node* r = find_previous_store_through_phis(phase, analyzer, in, visited, budget);
+        if (r == nullptr) {
+          return nullptr;
+        } else if (r == NodeSentinel) {
+          continue;
+        } else if (result == NodeSentinel) {
+          result = r;
+        } else if (result != r) {
+          return nullptr;
+        }
+      }
+      return result;
+    }
+    AccessAnalyzer::AccessIndependence independence = analyzer.detect_access_independence(mem);
+    if (!independence.independent) {
+      return independence.mem;
+    }
+    mem = independence.mem;
+  }
+}
+
 // The logic for reordering loads and stores uses four steps:
 // (a) Walk carefully past stores and initializations which we
 //     can prove are independent of this load.
@@ -841,7 +943,8 @@ Node* MemNode::find_previous_store(PhaseGVN* phase) {
   AccessAnalyzer analyzer(phase, this);
 
   Node* mem = in(MemNode::Memory); // start searching here...
-  int cnt = 50;                    // Cycle limiter
+  // Cycle limiter
+  int cnt = (FoldLoadsThroughCtorBarriers || FoldLocalFinalFieldLoads) ? 500 : 50;
   for (;; cnt--) {
     // While we can dance past unrelated stores...
     if (phase->type(mem) == Type::TOP) {
@@ -851,6 +954,17 @@ Node* MemNode::find_previous_store(PhaseGVN* phase) {
       // Caught in cycle or a complicated dance?
       return nullptr;
     } else if (mem->is_Phi()) {
+      // If all paths into the Phi lead to the same store (ignoring cycles) without passing a
+      // node that may write to the field, the load observes that store. Phis whose Region is
+      // still under construction during parsing are rejected by the walk.
+      if ((FoldLoadsThroughCtorBarriers && loaded_instance_field(phase, this) != nullptr) ||
+          is_local_trusted_final_field_load(phase, this)) {
+        ResourceMark rm;
+        VectorSet visited;
+        int budget = 2000;
+        Node* res = find_previous_store_through_phis(phase, analyzer, mem, visited, budget);
+        return (res == NodeSentinel) ? nullptr : res;
+      }
       return nullptr;
     }
 
@@ -1075,6 +1189,51 @@ AccessAnalyzer::AccessIndependence AccessAnalyzer::detect_access_independence(No
         // we are looking for.
         return {false, other};
       }
+    }
+  } else if (other->is_Proj() && other->in(0)->is_MemBar() && !other->in(0)->is_Initialize()) {
+    int opc = other->in(0)->Opcode();
+    bool is_release_barrier = opc == Op_MemBarRelease || opc == Op_StoreFence ||
+                              opc == Op_MemBarReleaseLock || opc == Op_MemBarStoreStore ||
+                              opc == Op_StoreStoreFence;
+    bool is_acquire_barrier = opc == Op_MemBarAcquire || opc == Op_MemBarAcquireLock ||
+                              opc == Op_LoadFence || opc == Op_MemBarVolatile;
+    if (FoldLoadsThroughCtorBarriers && is_release_barrier &&
+        loaded_instance_field(_phase, _n) != nullptr) {
+      // A release-type barrier does not write to memory and a load of a non-volatile field may
+      // be moved up past it (see LoadNode::can_see_stored_value_through_membars). Such barriers
+      // end every constructor that writes a final field, which would otherwise prevent the
+      // fields of all objects constructed earlier from being folded until Escape Analysis.
+      return {true, other->in(0)->in(TypeFunc::Memory)};
+    }
+    if ((is_release_barrier || is_acquire_barrier) && _alloc != nullptr &&
+        is_local_trusted_final_field_load(_phase, _n)) {
+      return {true, other->in(0)->in(TypeFunc::Memory)};
+    }
+  } else if (other->is_Proj() && other->in(0)->is_Call() && _alloc != nullptr &&
+             (other->in(0)->is_CallJava() || other->in(0)->is_AbstractLock()) &&
+             is_local_trusted_final_field_load(_phase, _n)) {
+    // A trusted final field can only be written by a constructor of the object. Since the
+    // object has been created by a 'new' bytecode, a constructor that hasn't been inlined shows
+    // up as a direct call to an <init> method that receives the object. Any other call can't
+    // change what the load observes.
+    CallNode* call = other->in(0)->as_Call();
+    bool may_be_constructor = false;
+    if (call->is_CallJava()) {
+      ciMethod* callee = call->as_CallJava()->method();
+      if (callee == nullptr || callee->is_object_constructor() || callee->is_method_handle_intrinsic() ||
+          callee->is_compiled_lambda_form()) {
+        const TypeTuple* domain = call->tf()->domain_cc();
+        for (uint i = TypeFunc::Parms; i < domain->cnt(); i++) {
+          Node* arg = call->in(i);
+          if (arg != nullptr && AllocateNode::Ideal_allocation(arg) == _alloc) {
+            may_be_constructor = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!may_be_constructor) {
+      return {true, call->in(TypeFunc::Memory)};
     }
   }
 

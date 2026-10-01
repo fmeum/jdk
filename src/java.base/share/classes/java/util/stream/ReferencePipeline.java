@@ -49,6 +49,8 @@ import java.util.function.ToDoubleFunction;
 import java.util.function.ToIntFunction;
 import java.util.function.ToLongFunction;
 import jdk.internal.access.SharedSecrets;
+import jdk.internal.vm.annotation.ForceInline;
+import jdk.internal.vm.annotation.TrustFinalFields;
 
 /**
  * Abstract base class for an intermediate pipeline stage or pipeline source
@@ -181,41 +183,104 @@ abstract class ReferencePipeline<P_IN, P_OUT>
     @Override
     public final Stream<P_OUT> filter(Predicate<? super P_OUT> predicate) {
         Objects.requireNonNull(predicate);
-        return new StatelessOp<>(this, StreamShape.REFERENCE,
-                StreamOpFlag.NOT_SIZED) {
-            @Override
-            Sink<P_OUT> opWrapSink(int flags, Sink<P_OUT> sink) {
-                return new Sink.ChainedReference<>(sink) {
-                    @Override
-                    public void begin(long size) {
-                        downstream.begin(-1);
-                    }
+        return new FilterOp<>(this, predicate);
+    }
 
-                    @Override
-                    public void accept(P_OUT u) {
-                        if (predicate.test(u))
-                            downstream.accept(u);
-                    }
-                };
-            }
-        };
+    // The stages and sinks of the most common stateless operations are named
+    // classes rather than anonymous ones so that their final fields can be
+    // trusted by the JIT: once a pipeline has been inlined into its caller,
+    // this allows the calls to the user-supplied functions and to downstream
+    // sinks to be bound based on the objects stored in these fields rather
+    // than on type profiles, which are shared by all pipelines and thus
+    // heavily polluted.
+
+    @TrustFinalFields
+    private static final class FilterOp<T> extends StatelessOp<T, T> {
+        private final Predicate<? super T> predicate;
+
+        FilterOp(AbstractPipeline<?, T, ?> upstream, Predicate<? super T> predicate) {
+            // Assigned first so that the store directly follows the allocation
+            this.predicate = predicate;
+            super(upstream, StreamShape.REFERENCE, StreamOpFlag.NOT_SIZED);
+        }
+
+        @Override
+        Sink<T> opWrapSink(int flags, Sink<T> sink) {
+            return new FilterSink<>(sink, predicate);
+        }
+    }
+
+    @TrustFinalFields
+    private static final class FilterSink<T> extends Sink.ChainedReference<T, T> {
+        private final Predicate<? super T> predicate;
+
+        FilterSink(Sink<? super T> downstream, Predicate<? super T> predicate) {
+            this.predicate = predicate;
+            super(downstream);
+        }
+
+        @Override
+        public void begin(long size) {
+            downstream.begin(-1);
+        }
+
+        @Override
+        public void accept(T u) {
+            if (predicate.test(u))
+                downstream.accept(u);
+        }
+
+        @Override
+        public void end() {
+            downstream.end();
+        }
+    }
+
+    @TrustFinalFields
+    private static final class MapOp<T, R> extends StatelessOp<T, R> {
+        private final Function<? super T, ? extends R> mapper;
+
+        MapOp(AbstractPipeline<?, T, ?> upstream, Function<? super T, ? extends R> mapper) {
+            this.mapper = mapper;
+            super(upstream, StreamShape.REFERENCE,
+                  StreamOpFlag.NOT_SORTED | StreamOpFlag.NOT_DISTINCT);
+        }
+
+        @Override
+        Sink<T> opWrapSink(int flags, Sink<R> sink) {
+            return new MapSink<>(sink, mapper);
+        }
+    }
+
+    @TrustFinalFields
+    private static final class MapSink<T, R> extends Sink.ChainedReference<T, R> {
+        private final Function<? super T, ? extends R> mapper;
+
+        MapSink(Sink<? super R> downstream, Function<? super T, ? extends R> mapper) {
+            this.mapper = mapper;
+            super(downstream);
+        }
+
+        @Override
+        public void begin(long size) {
+            downstream.begin(size);
+        }
+
+        @Override
+        public void accept(T u) {
+            downstream.accept(mapper.apply(u));
+        }
+
+        @Override
+        public void end() {
+            downstream.end();
+        }
     }
 
     @Override
     public final <R> Stream<R> map(Function<? super P_OUT, ? extends R> mapper) {
         Objects.requireNonNull(mapper);
-        return new StatelessOp<>(this, StreamShape.REFERENCE,
-                StreamOpFlag.NOT_SORTED | StreamOpFlag.NOT_DISTINCT) {
-            @Override
-            Sink<P_OUT> opWrapSink(int flags, Sink<R> sink) {
-                return new Sink.ChainedReference<>(sink) {
-                    @Override
-                    public void accept(P_OUT u) {
-                        downstream.accept(mapper.apply(u));
-                    }
-                };
-            }
-        };
+        return new MapOp<>(this, mapper);
     }
 
     @Override
@@ -639,6 +704,7 @@ abstract class ReferencePipeline<P_IN, P_OUT>
 
     @Override
     @SuppressWarnings("unchecked")
+    @ForceInline
     public final <A> A[] toArray(IntFunction<A[]> generator) {
         // Since A has no relation to U (not possible to declare that A is an upper bound of U)
         // there will be no static type checking.
@@ -654,11 +720,13 @@ abstract class ReferencePipeline<P_IN, P_OUT>
     }
 
     @Override
+    @ForceInline
     public final Object[] toArray() {
         return toArray(Object[]::new);
     }
 
     @Override
+    @ForceInline
     public List<P_OUT> toList() {
         return SharedSecrets.getJavaUtilCollectionAccess().listFromTrustedArrayNullsAllowed(this.toArray());
     }
